@@ -20,6 +20,9 @@
 # production
 /build
 
+# compiled authoritative server (npm run build:server output)
+/.server/
+
 # misc
 .DS_Store
 *.pem

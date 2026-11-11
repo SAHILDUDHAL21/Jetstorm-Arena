@@ -1,69 +1,138 @@
-import Image from "next/image";
+'use client';
 
-export default function Home() {
+import { Suspense, useEffect, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
+import dynamic from 'next/dynamic';
+import { addNetListener, currentRoom, getNet } from '@/lib/client/net';
+import {
+  getLastRoomCode, getUserName, saveUserName, suggestedName,
+} from '@/lib/client/profile';
+import { MainMenu } from '@/components/MainMenu';
+import { Settings } from '@/components/Settings';
+import { HowToPlay } from '@/components/HowToPlay';
+
+// Phaser only runs in the browser — keep it out of the server prerender.
+const MenuBackground = dynamic(
+  () => import('@/components/MenuBackground').then((m) => m.MenuBackground),
+  { ssr: false },
+);
+
+export default function HomePage() {
+  const router = useRouter();
+  const [name, setName] = useState('');
+  const [code, setCode] = useState('');
+  const [mapId, setMapId] = useState('random');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [lastRoom, setLastRoom] = useState<string | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
+  const [netStatus, setNetStatus] = useState<'connecting' | 'online' | 'offline'>('connecting');
+  const busyRef = useRef(false);
+  const offlineTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Resume an in-flight session (e.g. browser Back after leaving the game).
+  useEffect(() => {
+    const room = currentRoom();
+    if (room) {
+      router.replace(room.phase === 'lobby' ? `/lobby?code=${room.code}` : `/game?code=${room.code}`);
+      return;
+    }
+    const saved = getUserName() || suggestedName();
+    setName(saved);
+    setLastRoom(getLastRoomCode());
+  }, [router]);
+
+  // Room/error routing for create/join/quick.
+  useEffect(() => {
+    const off = addNetListener({
+      onRoom: (room) => {
+        if (!busyRef.current) return;
+        busyRef.current = false;
+        router.push(`/lobby?code=${room.code}`);
+      },
+      onError: (_c, msg) => {
+        busyRef.current = false;
+        setBusy(false);
+        setError(msg);
+      },
+      onStatus: (s) => {
+        setNetStatus(s);
+        // A transient offline blip resolves itself via the WS→SSE fallback;
+        // if we're still offline a moment later, un-stick the UI. Connection
+        // diagnostics go to the browser console, not the page.
+        if (s === 'offline' && busyRef.current) {
+          if (!offlineTimer.current) {
+            offlineTimer.current = setTimeout(() => {
+              offlineTimer.current = null;
+              if (busyRef.current) {
+                busyRef.current = false;
+                setBusy(false);
+                console.warn(
+                  '[Jetstorm] Can’t reach the game server. Start it with `npm run dev` (or `npm run start`) and reload this page — the page must be served by the Node server that hosts the game socket.',
+                );
+              }
+            }, 1500);
+          }
+        } else if (s === 'online' && offlineTimer.current) {
+          clearTimeout(offlineTimer.current);
+          offlineTimer.current = null;
+        }
+      },
+    });
+    return () => {
+      off();
+      if (offlineTimer.current) clearTimeout(offlineTimer.current);
+    };
+  }, [router]);
+
+  const launch = (mode: 'create' | 'quick' | { join: string }) => {
+    const finalName = (name.trim() || suggestedName()).slice(0, 16);
+    if (finalName.length < 2) {
+      setError('Callsign must be at least 2 characters.');
+      return;
+    }
+    saveUserName(finalName);
+    setError('');
+    setBusy(true);
+    busyRef.current = true;
+    const net = getNet();
+    net.connect();
+    net.sendNameJoin(
+      mode === 'create' ? { kind: 'create' } : mode === 'quick' ? { kind: 'quick' } : { kind: 'join', code: mode.join },
+      finalName,
+      undefined,
+      mode === 'create' && mapId !== 'random' ? mapId : undefined,
+    );
+  };
+
+  const rejoin = () => {
+    const c = lastRoom;
+    if (c) launch({ join: c });
+  };
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+    <main className="relative">
+      <MenuBackground />
+      <MainMenu
+        name={name}
+        setName={setName}
+        code={code}
+        setCode={setCode}
+        mapId={mapId}
+        setMapId={setMapId}
+        busy={busy}
+        error={error}
+        lastRoom={lastRoom}
+        onCreate={() => launch('create')}
+        onJoin={() => launch({ join: code })}
+        onQuick={() => launch('quick')}
+        onRejoin={rejoin}
+        onHelp={() => setShowHelp(true)}
+        onSettings={() => setShowSettings(true)}
+      />
+      {showSettings && <Settings onClose={() => setShowSettings(false)} />}
+      {showHelp && <HowToPlay onClose={() => setShowHelp(false)} />}
+    </main>
   );
 }

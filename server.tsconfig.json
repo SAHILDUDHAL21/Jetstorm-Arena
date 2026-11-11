@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "commonjs",
+    "moduleResolution": "node10",
+    "outDir": ".server",
+    "rootDir": ".",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "declaration": false,
+    "sourceMap": false,
+    "incremental": false,
+    "types": ["node"]
+  },
+  "include": ["server/**/*.ts", "shared/**/*.ts", "scripts/**/*.ts"],
+  "exclude": ["node_modules", ".next", ".server"]
+}

@@ -1,9 +1,13 @@
 /**
- * Networking hub for the HTTP/SSE transport (Vercel-compatible realtime).
+ * Networking hub for the HTTP short-poll transport (Vercel-compatible
+ * realtime).
  *
- * One hub per server instance. Players connect with:
- *   - downlink: GET /api/rt/stream  (SSE, per session)
- *   - uplink:   POST /api/rt/msg    (batched messages)
+ * One hub per server instance. Players connect with a single endpoint:
+ *   POST /api/rt/msg  { sid, msgs } → { out: ServerMsg[] }
+ * Each request carries uplink messages and returns the session's buffered
+ * downlink messages. Nothing is held open, so every request is short and the
+ * platform keeps routing it to the same warm instance (rooms live in that
+ * instance's memory).
  *
  * Rooms are simulated by exactly one instance (lease owner). When Redis is
  * configured, other instances stream the published room blob to their local
@@ -21,7 +25,6 @@ import { RateLimiter } from './ratelimit';
 const LEASE_TTL_MS = 4000;
 const BLOB_TTL_SEC = 8;
 const TICK_MS = 1000 / 30;
-const POLL_MS = 66;
 
 export interface Session {
   sid: string;
@@ -32,7 +35,15 @@ export interface Session {
   lastChatId: number;
   lastNoticeId: number;
   closed: boolean;
+  /** Outbound messages waiting for the next client poll. */
+  buf: ServerMsg[];
+  /** Last client poll — sessions that stop polling are swept. */
+  lastPollAt: number;
 }
+
+const SESSION_BUF_MAX = 200;
+/** A session that hasn't polled for this long is treated as disconnected. */
+const SESSION_LIVENESS_MS = 15_000;
 
 interface HubGlobal {
   instanceId: string;
@@ -170,20 +181,22 @@ export class Hub {
     return this.g.store.mode;
   }
 
-  // ── Streams (sessions) ─────────────────────────────────────────────────
+  // ── Sessions (short-poll transport) ────────────────────────────────────
 
-  attachStream(sid: string, send: (chunk: string) => void, close: () => void): Session {
-    const prev = this.g.sessions.get(sid);
+  /** Register a session. The client polls POST /api/rt/msg every ~33 ms;
+   * each poll drains the session's outbound buffer and refreshes liveness. */
+  attachSession(sid: string): Session {
     const conn: ManagedConn = {
       id: sid,
       send: (msg: ServerMsg) => {
-        try {
-          send(`data: ${JSON.stringify(msg)}\n\n`);
-        } catch {
-          /* stream closed */
-        }
+        const session = this.g.sessions.get(sid);
+        if (!session) return;
+        session.buf.push(msg);
+        while (session.buf.length > SESSION_BUF_MAX) session.buf.shift();
       },
-      close: () => close(),
+      close: () => {
+        this.detachSession(sid);
+      },
       rate: new RateLimiter(),
       roomId: null,
       playerId: null,
@@ -198,54 +211,33 @@ export class Hub {
       lastChatId: 0,
       lastNoticeId: 0,
       closed: false,
+      buf: [],
+      lastPollAt: Date.now(),
     };
     this.g.sessions.set(sid, session);
-    if (prev && !prev.closed) {
-      // Stream replaced while the session is still alive (platform rotates the
-      // SSE stream at maxDuration, or a network blip dropped it). Carry the
-      // membership and delivery cursors onto the fresh stream; for a locally
-      // owned room, attach the new conn directly so the player keeps receiving
-      // sends. A follow-up hello/token reclaim is idempotent after this.
-      const pc = prev.conn;
-      conn.roomId = pc.roomId;
-      conn.playerId = pc.playerId;
-      conn.name = pc.name;
-      session.roomId = prev.roomId;
-      session.lastBlobTs = prev.lastBlobTs;
-      session.lastSnapTick = prev.lastSnapTick;
-      session.lastChatId = prev.lastChatId;
-      session.lastNoticeId = prev.lastNoticeId;
-      const room = pc.roomId ? this.g.mgr.rooms.get(pc.roomId) : undefined;
-      if (room && pc.playerId) {
-        // Attach the fresh conn first, then drop the dead predecessor — with
-        // the new conn already in the set this is a silent swap (no disconnect
-        // notice, no grace countdown).
-        if (room.attachConn(pc.playerId, conn)) room.detachConn(pc);
-      }
-    }
-    // The previous instance may be gone entirely (hard kill): the store's
-    // route record tells this fresh session which room to keep serving.
-    void this.restoreSessionRoute(sid, session);
     return session;
   }
 
-  /** Restore room membership for a re-attached session from the shared store
-   * (written when the stream instance last drained a welcome). */
-  private async restoreSessionRoute(sid: string, session: Session): Promise<void> {
-    if (session.closed || session.roomId) return;
-    try {
-      const prev = await this.g.store.getSessionRoute(sid);
-      if (!prev) return;
-      if (prev.room && !session.closed && !session.roomId) {
-        session.roomId = prev.room;
-        if (prev.pid && !session.conn.playerId) session.conn.playerId = prev.pid;
+  /** Drain the session's outbound messages (one client poll). Attaches the
+   * session on the first poll — polls are how the server learns a client is
+   * alive, so there is no separate connect step. */
+  async pollSession(sid: string, max: number): Promise<ServerMsg[] | null> {
+    let session = this.g.sessions.get(sid);
+    if (!session) {
+      // Redis mode: a route record means the session lives on another
+      // instance — don't create a shadow copy here.
+      if (this.g.store.mode === 'redis') {
+        const route = await this.g.store.getSessionRoute(sid).catch(() => null);
+        if (route?.room) return null;
       }
-    } catch {
-      /* store unavailable — hello/token reclaim still works */
+      session = this.attachSession(sid);
     }
+    session.lastPollAt = Date.now();
+    if (session.buf.length === 0) return [];
+    return session.buf.splice(0, max);
   }
 
-  detachStream(sid: string): void {
+  detachSession(sid: string): void {
     const session = this.g.sessions.get(sid);
     if (!session) return;
     session.closed = true;
@@ -266,9 +258,14 @@ export class Hub {
     void this.g.store.dropSession(sid).catch(() => {});
   }
 
-  /** SSE writer should stop when the session vanished. */
-  isSessionLive(sid: string): boolean {
-    return this.g.sessions.has(sid);
+  /** Drop sessions that stopped polling (closed tab, network death). They go
+   * through the same path as an explicit leave: disconnect grace in a match,
+   * immediate removal in a lobby. */
+  private sweepSessions(now: number): void {
+    for (const [sid, session] of [...this.g.sessions]) {
+      if (session.closed) continue;
+      if (now - session.lastPollAt > SESSION_LIVENESS_MS) this.detachSession(sid);
+    }
   }
 
   sessionCount(): number {
@@ -278,13 +275,17 @@ export class Hub {
   // ── Uplink ─────────────────────────────────────────────────────────────
 
   async handleUplink(sid: string, raw: unknown): Promise<boolean> {
-    const session = this.g.sessions.get(sid);
-    if (session) return this.handleLocal(session, raw);
-    // No session on this instance: on serverless the POST may have landed on a
-    // different lambda than the one holding the SSE stream. Route via the
-    // shared store when available; otherwise signal the client to retry.
-    if (this.g.store.mode !== 'redis') return false;
-    return this.handleRemote(sid, raw);
+    let session = this.g.sessions.get(sid);
+    if (!session) {
+      // Redis mode: a route record means the session lives on another
+      // instance — route through the store instead of re-creating it here.
+      if (this.g.store.mode === 'redis') {
+        const route = await this.g.store.getSessionRoute(sid).catch(() => null);
+        if (route?.room) return this.handleRemote(sid, raw);
+      }
+      session = this.attachSession(sid);
+    }
+    return this.handleLocal(session, raw);
   }
 
   /** Uplink on the instance that owns the session. */
@@ -495,6 +496,7 @@ export class Hub {
     g.ticking = true;
     try {
       mgrTick(g);
+      this.sweepSessions(Date.now());
       if (g.store.mode === 'redis') {
         await this.redisTick();
       }

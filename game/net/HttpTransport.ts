@@ -1,14 +1,23 @@
 /**
- * SSE + POST transport for serverless hosting (Vercel).
- *   downlink: EventSource → /api/rt/stream (auto-reconnects)
- *   uplink:   batched POST → /api/rt/msg every ~33ms
+ * Short-poll transport for serverless hosting (Vercel).
+ * One POST to /api/rt/msg every ~33 ms carries queued uplink messages and
+ * returns the session's buffered downlink messages:
+ *   { sid, msgs } → { out: ServerMsg[] }
  *
- * The uplink waits for the stream's first successful open: the server
- * registers the session when the stream attaches, and a POST that arrives
- * earlier (cold starts can take seconds) would be dropped silently.
+ * No request is ever held open, so the platform keeps serving this session
+ * from the same warm instance where its room lives — long-lived SSE streams
+ * get the opposite treatment (the router spreads concurrent requests to other
+ * instances, and functions get killed at maxDuration).
  */
 import type { ClientMsg, ServerMsg } from '../../shared/types';
 import type { NetStatus, Transport } from './Transport';
+
+const POLL_FAST_MS = 33; // in a room (lobby or match)
+const POLL_SLOW_MS = 400; // menus: presence only
+const FAILURE_BACKOFF_MS = 300;
+/** Consecutive failures before we conclude this instance lost the session
+ * and start over with a fresh sid (the room is reclaimed via hello/join). */
+const RESET_AFTER_FAILURES = 40;
 
 function makeSid(): string {
   return `s${Math.random().toString(36).slice(2, 12)}${Date.now().toString(36).slice(-4)}`;
@@ -18,96 +27,88 @@ export class HttpTransport implements Transport {
   onMessage: (msg: ServerMsg) => void = () => {};
   onStatus: (status: NetStatus) => void = () => {};
   private sid = makeSid();
-  private es: EventSource | null = null;
   private closed = false;
   private queue: ClientMsg[] = [];
-  private flushTimer: ReturnType<typeof setInterval> | null = null;
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private fast = false;
   private lastGood = 0;
-  /** Set after the first stream open — uplink is gated on it. */
-  private everOpened = false;
-  /** Earliest next uplink attempt after a failure (ms epoch). */
+  private everOnline = false;
+  private inFlight = false;
   private retryAt = 0;
+  private failures = 0;
 
   connect(): void {
     this.closed = false;
     this.onStatus('connecting');
-    this.openStream();
-    if (!this.flushTimer) {
-      this.flushTimer = setInterval(() => void this.flush(), 33);
+    if (!this.timer) {
+      this.timer = setInterval(() => void this.tick(), this.interval());
     }
   }
 
-  private openStream(): void {
-    if (this.es) this.es.close();
-    const es = new EventSource(`/api/rt/stream?sid=${encodeURIComponent(this.sid)}`);
-    this.es = es;
-    es.onopen = () => {
-      this.everOpened = true;
-      this.onStatus('online');
-      void this.flush(); // drain anything queued while the stream was opening
-    };
-    es.onmessage = (ev) => {
-      try {
-        const msg = JSON.parse(ev.data) as ServerMsg;
-        this.lastGood = Date.now();
-        this.onMessage(msg);
-      } catch {
-        /* ignore */
-      }
-    };
-    es.onerror = () => {
-      if (!this.closed) {
-        if (Date.now() - this.lastGood > 6000) this.onStatus('offline');
-        else if (es.readyState === EventSource.CLOSED) {
-          // server restarted or stream cut: open a fresh one
-          setTimeout(() => {
-            if (!this.closed) this.openStream();
-          }, 800);
-        }
-      }
-    };
+  /** Faster polling while in a room, slow presence polling on menus. */
+  setRate(fast: boolean): void {
+    if (this.fast === fast) return;
+    this.fast = fast;
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = setInterval(() => void this.tick(), this.interval());
+    }
   }
 
-  private async flush(): Promise<void> {
-    if (this.closed || this.queue.length === 0) return;
-    // Before the first stream open there is no server-side session yet —
-    // sending now would lose these messages. Wait; openStream() flushes.
-    if (!this.everOpened) return;
-    // Brief backoff after a failure so a cold-start 503 storm doesn't hammer.
+  private interval(): number {
+    return this.fast ? POLL_FAST_MS : POLL_SLOW_MS;
+  }
+
+  private async tick(): Promise<void> {
+    if (this.closed || this.inFlight) return;
     if (Date.now() < this.retryAt) return;
     const msgs = this.queue;
     this.queue = [];
+    this.inFlight = true;
     try {
       const res = await fetch('/api/rt/msg', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sid: this.sid, msgs }),
-        keepalive: false,
       });
-      if (!res.ok && msgs.some((m) => m.t !== 'input')) {
-        // requeue control messages on failure (bounded)
-        const control = msgs.filter((m) => m.t !== 'input');
-        if (control.length && this.queue.length < 10) this.queue.unshift(...control);
-        this.retryAt = Date.now() + 300;
+      if (!res.ok) throw new Error(`status ${res.status}`);
+      const data = (await res.json()) as { out?: ServerMsg[] };
+      this.lastGood = Date.now();
+      this.failures = 0;
+      if (!this.everOnline) {
+        this.everOnline = true;
+        this.onStatus('online');
       }
+      for (const m of data.out ?? []) this.onMessage(m);
     } catch {
-      if (msgs.some((m) => m.t !== 'input') && this.queue.length < 10) {
-        this.queue.unshift(...msgs.filter((m) => m.t !== 'input'));
+      this.failures++;
+      this.retryAt = Date.now() + FAILURE_BACKOFF_MS;
+      // requeue control messages (bounded); input frames are ephemeral
+      const control = msgs.filter((m) => m.t !== 'input');
+      if (control.length && this.queue.length < 10) this.queue.unshift(...control);
+      if (Date.now() - this.lastGood > 6000) this.onStatus('offline');
+      // The session is gone for good (instance recycled, platform shuffling):
+      // a fresh sid re-enters the world; hello/join reclaims the room slot.
+      if (this.failures >= RESET_AFTER_FAILURES) {
+        this.failures = 0;
+        this.sid = makeSid();
+        this.everOnline = false;
+        this.onStatus('connecting');
       }
-      this.retryAt = Date.now() + 300;
+    } finally {
+      this.inFlight = false;
     }
   }
 
   close(): void {
     this.closed = true;
-    if (this.flushTimer) clearInterval(this.flushTimer);
-    this.flushTimer = null;
-    this.es?.close();
-    this.es = null;
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+    // Tell the server we left (keepalive so it survives the page unload).
     void fetch('/api/rt/msg', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sid: this.sid, msgs: [{ t: 'leave' }] }),
+      body: JSON.stringify({ sid: this.sid, msgs: [{ t: 'leave' }], final: true }),
       keepalive: true,
     }).catch(() => {});
   }

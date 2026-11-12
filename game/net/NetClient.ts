@@ -49,11 +49,9 @@ export class NetClient {
     this.transport.onMessage = (m) => this.handle(m);
     this.transport.onStatus = (s) => {
       this.status = s;
-      // The stream/socket can be replaced mid-session (Vercel rotates the SSE
-      // stream at its max-duration limit, or a network blip drops it). The
-      // replacement stream attaches a fresh conn server-side, so re-claim the
-      // room slot with the issued token — the server re-attaches us and the
-      // match continues. Idempotent: hello without membership just acks.
+      // The session can be lost mid-session (instance recycled, network blip).
+      // Re-claim the room slot with the issued token once we're reachable
+      // again — idempotent: hello without membership just acks.
       if (s === 'online' && this.token) {
         this.transport.send({ t: 'hello', name: this.name, token: this.token });
       }
@@ -98,6 +96,7 @@ export class NetClient {
         break;
       case 'room':
         this.room = m.room;
+        this.transport.setRate?.(true); // in a room: poll fast
         if (this.token) {
           try {
             sessionStorage.setItem(tokenKey(m.room.code), this.token);

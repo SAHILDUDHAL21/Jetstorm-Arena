@@ -114,6 +114,7 @@ export function leaveRoom(): void {
   n.leave();
   n.room = null;
   n.latestSnap = null;
+  n.transport.setRate?.(false); // back to the menu: slow presence polling
   setLastRoomCode(null);
 }
 

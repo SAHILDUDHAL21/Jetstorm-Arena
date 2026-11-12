@@ -1,10 +1,10 @@
 /**
- * Transport abstraction: client can run over WebSocket (self-hosted custom
- * server) or SSE+POST (Vercel serverless). The game and UI are unaware of
- * which one is active.
+ * Transport interface: client can run over WebSocket (self-hosted custom
+ * server) or short-poll HTTP (Vercel serverless). The game and UI are unaware
+ * of which one is active.
  *
  * Auto mode (default) starts on WebSocket and silently falls back to the
- * SSE routes if /ws does not answer — so the game works under `npm run dev`,
+ * poll routes if /ws does not answer — so the game works under `npm run dev`,
  * `npm run dev:web`, `npm run start`, and on hosts where the WS endpoint
  * was not proxied.
  */
@@ -20,6 +20,8 @@ export interface Transport {
   send(msg: ClientMsg): void;
   onMessage: (msg: ServerMsg) => void;
   onStatus: (status: NetStatus) => void;
+  /** Optional poll-rate hint: fast while in a room, slow on menus. */
+  setRate?(fast: boolean): void;
 }
 
 /** How long to wait for the WebSocket before switching to SSE. */
@@ -64,6 +66,10 @@ export class FallbackTransport implements Transport {
     this.active = ws;
     ws.onMessage = (m) => this.onMessage(m);
     ws.onStatus = (s) => this.handleWsStatus(s);
+  }
+
+  setRate(fast: boolean): void {
+    this.active.setRate?.(fast);
   }
 
   private handleWsStatus(s: NetStatus): void {

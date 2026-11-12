@@ -158,10 +158,10 @@ One authoritative simulation, two interchangeable transports:
         │  game/MatchSim (30 Hz)         │  client prediction     │
         │  validation + rate limiting    │  NetClient + Transport │
         └───────────┬───────────────────┴──────────┬─────────────┘
-                    │ WebSocket /ws                │ WebSocket or SSE
+                    │ WebSocket /ws                │ WebSocket or short-poll
         ┌───────────┴──────────┐        ┌────────────┴────────────┐
-        │ server/ws-server.ts  │        │ app/api/rt/{stream,msg} │
-        │ (self-hosted Node)   │        │ (serverless-friendly)   │
+        │ server/ws-server.ts  │        │      app/api/rt/msg     │
+        │ (self-hosted Node)   │        │ (short-poll: up + down) │
         └──────────────────────┘        └─────────────────────────┘
 ```
 
@@ -175,12 +175,15 @@ One authoritative simulation, two interchangeable transports:
   - `server/ws-server.ts` — custom Node server: Next.js + a real WebSocket at
     `/ws`. Used by `npm run dev` and `npm run start`. `GET /healthz` reports
     `{"ok":true,"rooms":N}`.
-  - `app/api/rt/stream` + `app/api/rt/msg` — SSE downlink + POST uplink for
-    platforms without persistent sockets (Vercel). Optional Upstash Redis keeps
-    rooms consistent across serverless instances (room blobs, ownership leases,
-    cross-instance messages, adoption when the owning instance dies).
+  - `app/api/rt/msg` — one short-poll endpoint for platforms without
+    persistent sockets (Vercel): each request carries uplink messages and
+    returns the session's buffered downlink. Requests return immediately, so
+    the platform keeps serving them from the same warm instance where the
+    room lives. Optional Upstash Redis keeps rooms consistent across
+    serverless instances (room blobs, ownership leases, cross-instance
+    messages, adoption when the owning instance dies).
   - The browser picks automatically: WebSocket on localhost / explicit
-    `NEXT_PUBLIC_WS_URL`, otherwise SSE.
+    `NEXT_PUBLIC_WS_URL`, otherwise short-poll.
 - **Client** — `game/net/NetClient.ts` is a singleton (`lib/client/net.ts`) that
   survives route changes (menu → lobby → game keep one connection). Reconnect
   after a hard reload uses `{ t: 'hello', name, token }` to reclaim the slot.
@@ -200,8 +203,7 @@ app/                     Next.js routes
   page.tsx               main menu (create/join/quick, map picker)
   lobby/page.tsx         lobby (players, chat, host controls)
   game/page.tsx          match screen
-  api/rt/stream          SSE downlink (Vercel transport)
-  api/rt/msg             POST uplink (Vercel transport)
+  api/rt/msg             short-poll realtime channel (up + down, Vercel transport)
 components/              React UI (menus, lobby, HUD, overlays, mobile controls)
 game/                    Phaser game layer
   scenes/                Boot, Preload, Menu, Match
@@ -213,7 +215,7 @@ server/                  authoritative side (transport-agnostic)
   rooms/                 Room, RoomManager
   game/sim.ts            MatchSim (30 Hz authoritative simulation)
   validation/            every inbound message validated here
-  networking/            ws transport, SSE hub, rate limiting
+  networking/            ws transport, poll hub, rate limiting
   store/                 MemoryStore / Upstash Redis store
   ws-server.ts           self-hosted entry point (Next + /ws)
 shared/                  constants, types, weapons, maps, physics
@@ -263,15 +265,12 @@ this process with upgrade support. Everything else is ordinary HTTP.
 vercel deploy
 ```
 
-`vercel.json` disables buffering for `/api/rt/*` so SSE chunks flush immediately.
-Works out of the box for small groups of players.
+`vercel.json` disables caching for `/api/rt/*` so polls are never buffered or
+served stale. Works out of the box for small groups of players.
 
-Serverless functions have a hard execution ceiling (`maxDuration = 300` on the
-Hobby plan), so the SSE stream **rotates itself every ~4.5 minutes**: it closes
-cleanly before the platform could kill it, the browser reconnects within a
-second (EventSource `retry` hint), and the player reclaims their slot with the
-session token — a running match continues without a visible disconnect. The
-same recovery covers any network blip that drops the stream.
+Requests to `/api/rt/msg` return immediately (nothing is held open), so the
+platform keeps serving a session from the same warm instance where its room
+lives — no long-lived streams that get killed at the function time limit.
 
 **Scaling beyond one instance:** without a shared store, rooms live in the
 memory of whichever serverless instance created them. To make rooms work across
@@ -314,14 +313,13 @@ stored blob. To force a transport in the browser, set `NEXT_PUBLIC_TRANSPORT`
 
 | Symptom | Likely cause / fix |
 | --- | --- |
-| Stuck on "Connecting…" in the menu | The WS server isn't reachable — run `npm run dev` (not `dev:web`) for local play, or set `NEXT_PUBLIC_TRANSPORT=http` to use the SSE transport. |
+| Stuck on "Connecting…" in the menu | The WS server isn't reachable — run `npm run dev` (not `dev:web`) for local play, or set `NEXT_PUBLIC_TRANSPORT=http` to use the poll transport. |
 | `room_not_found` when joining | Room codes expire when rooms empty out — create a new room. |
 | Rejoin after refresh puts me in the lobby | You were outside the 30 s reconnect window or the match had already ended. Start/join again. |
 | Two tabs behave oddly | Each tab is its own session (own token). One session per tab is intended. |
 | No audio until you play | Browsers require a user gesture; audio unlocks on first click/touch. |
 | `test:mp` timing out | The suite needs ~2–3 min wall clock; give it a generous timeout. |
-| SSE stream stalls behind a proxy | Ensure the proxy doesn't buffer responses (`X-Accel-Buffering: no` is already sent; nginx needs `proxy_buffering off`). |
-| Game freezes after ~5 min on Vercel | Streams rotate at the platform's `maxDuration`; reconnect + token reclaim should be seamless. If it freezes, the reconnect likely landed on a different serverless instance — add the Upstash Redis variables so rooms work across instances. |
+| Requests 503 with `no session — retry` | The poll landed on a different serverless instance than the one holding the session. The client retries automatically and resets to a fresh session if it persists; add the Upstash Redis variables for deterministic multi-instance routing. |
 
 ---
 

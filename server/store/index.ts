@@ -35,6 +35,14 @@ export interface InboxItem {
   msg: unknown;
 }
 
+/** Where a session's SSE stream lives and which room it is in (cross-instance uplink routing). */
+export interface SessionRoute {
+  room: string | null;
+  pid: string | null;
+}
+
+export type LeaseResult = 'owned' | 'adopted' | 'lost';
+
 export interface RealtimeStore {
   readonly mode: 'memory' | 'redis';
   getBlob(code: string): Promise<RoomBlob | null>;
@@ -51,6 +59,18 @@ export interface RealtimeStore {
   /** token → {code} global index for reconnects across instances. */
   setTokenIndex(token: string, code: string): Promise<void>;
   getTokenIndex(token: string): Promise<string | null>;
+  /** Cross-instance uplink routing: which room a session belongs to. */
+  setSessionRoute(sid: string, route: SessionRoute): Promise<void>;
+  getSessionRoute(sid: string): Promise<SessionRoute | null>;
+  /**
+   * Atomic lease renewal that adopts a free/expired lease instead of failing.
+   * 'owned' = renewed, 'adopted' = took over a dead lease, 'lost' = owned elsewhere.
+   */
+  renewOrAdoptLease(code: string, ownerId: string, ttlMs: number): Promise<LeaseResult>;
+  /** Batched drains: one round-trip for many sessions (serverless cost). */
+  drainOutMany(sids: string[], max: number): Promise<Map<string, ServerMsg[]>>;
+  /** Batched blob reads: one round-trip for many rooms. */
+  getBlobs(codes: string[]): Promise<Map<string, RoomBlob | null>>;
   dropSession(sid: string): Promise<void>;
 }
 
@@ -155,6 +175,34 @@ export class MemoryStore implements RealtimeStore {
 
   async getTokenIndex(token: string) {
     return (this.get(`tok:${token}`) as string) ?? null;
+  }
+
+  async setSessionRoute(sid: string, route: SessionRoute) {
+    this.set(`route:${sid}`, route, 120_000);
+  }
+
+  async getSessionRoute(sid: string) {
+    return (this.get(`route:${sid}`) as SessionRoute) ?? null;
+  }
+
+  async renewOrAdoptLease(code: string, ownerId: string, ttlMs: number): Promise<LeaseResult> {
+    const key = `lease:${code}`;
+    const cur = this.get(key) as { owner: string } | null;
+    if (cur && cur.owner !== ownerId) return 'lost';
+    this.set(key, { owner: ownerId }, ttlMs);
+    return cur ? 'owned' : 'adopted';
+  }
+
+  async drainOutMany(sids: string[], max: number) {
+    const out = new Map<string, ServerMsg[]>();
+    for (const sid of sids) out.set(sid, await this.drainOut(sid, max));
+    return out;
+  }
+
+  async getBlobs(codes: string[]) {
+    const out = new Map<string, RoomBlob | null>();
+    for (const code of codes) out.set(code, await this.getBlob(code));
+    return out;
   }
 
   async dropSession(sid: string) {
@@ -278,6 +326,56 @@ export class UpstashStore implements RealtimeStore {
   async getTokenIndex(token: string) {
     const v = await this.single(['GET', `jsa:tok:${token}`]);
     return typeof v === 'string' ? v : null;
+  }
+
+  async setSessionRoute(sid: string, route: SessionRoute) {
+    await this.pipeline([['SET', `jsa:sess:${sid}`, JSON.stringify(route), 'EX', '120']]);
+  }
+
+  async getSessionRoute(sid: string) {
+    return UpstashStore.parse<SessionRoute>(await this.single(['GET', `jsa:sess:${sid}`]));
+  }
+
+  async renewOrAdoptLease(code: string, ownerId: string, ttlMs: number): Promise<LeaseResult> {
+    // Atomic: renew when we own it, adopt when free/expired, lose otherwise.
+    const r = await this.single([
+      'EVAL',
+      "local cur=redis.call('get',KEYS[1]) if cur==ARGV[1] then redis.call('pexpire',KEYS[1],ARGV[2]) return 1 end if (not cur) then redis.call('set',KEYS[1],ARGV[1],'PX',ARGV[2]) return 2 end return 0",
+      '1',
+      `jsa:lease:${code}`,
+      ownerId,
+      String(ttlMs),
+    ]);
+    if (r === 1) return 'owned';
+    if (r === 2) return 'adopted';
+    return 'lost';
+  }
+
+  async drainOutMany(sids: string[], max: number) {
+    const out = new Map<string, ServerMsg[]>();
+    if (sids.length === 0) return out;
+    const cmds: unknown[][] = [];
+    for (const sid of sids) {
+      cmds.push(
+        ['LRANGE', `jsa:out:${sid}`, '0', String(max - 1)],
+        ['LTRIM', `jsa:out:${sid}`, String(max), '-1'],
+        ['EXPIRE', `jsa:out:${sid}`, '30'],
+      );
+    }
+    const res = await this.pipeline(cmds);
+    sids.forEach((sid, i) => {
+      out.set(sid, UpstashStore.parse<ServerMsg[]>(res[i * 3]?.result) ?? []);
+    });
+    return out;
+  }
+
+  async getBlobs(codes: string[]) {
+    const out = new Map<string, RoomBlob | null>();
+    if (codes.length === 0) return out;
+    const res = await this.pipeline([['MGET', ...codes.map((c) => `jsa:blob:${c}`)]]);
+    const arr = (res[0]?.result as unknown[] | null) ?? null;
+    codes.forEach((code, i) => out.set(code, UpstashStore.parse<RoomBlob>(arr?.[i] ?? null)));
+    return out;
   }
 
   async dropSession(sid: string) {

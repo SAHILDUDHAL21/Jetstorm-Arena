@@ -6,7 +6,7 @@ import type { ServerMsg, WeaponId } from '../../shared/types';
 import type { MapId } from '../../shared/maps';
 import { RateLimiter } from '../networking/ratelimit';
 import { errorText, makeRoomCode, parseClientMsg, validateCode } from '../validation';
-import { Room, pickMapId, type RoomHost, type RoomOutput, type ServerConn } from './room';
+import { Room, pickMapId, type Member, type RoomHost, type RoomOutput, type ServerConn } from './room';
 
 export interface ManagedConn extends ServerConn {
   rate: RateLimiter;
@@ -27,6 +27,24 @@ export class RoomManager implements RoomHost {
 
   now(): number {
     return Date.now();
+  }
+
+  /** Hook for Redis-backed hosts: mirror token → room so reconnects can be
+   * routed from any instance. */
+  protected onTokenIndexed(_code: string, _token: string): void {}
+
+  /** Attach a member to a connection. Remote (cross-instance) sessions have
+   * no real conn here — the facade's routing fields must still be filled in,
+   * or later uplink batches (input frames) are rejected as "not in a room". */
+  protected attachMember(room: Room, m: Member, conn: ManagedConn): void {
+    if (conn.remoteSid) {
+      room.attachRemote(m.id, conn.remoteSid);
+      conn.roomId = room.code;
+      conn.playerId = m.id;
+    } else {
+      room.attachConn(m.id, conn);
+    }
+    conn.name = m.name;
   }
 
   // ── RoomHost ───────────────────────────────────────────────────────────
@@ -101,12 +119,7 @@ export class RoomManager implements RoomHost {
           const room = this.rooms.get(roomId);
           const m = room?.memberByToken(msg.token!);
           if (room && m) {
-            if (conn.remoteSid) {
-              room.attachRemote(m.id, conn.remoteSid);
-            } else {
-              room.attachConn(m.id, conn);
-            }
-            conn.name = m.name;
+            this.attachMember(room, m, conn);
             room.sendWelcome(m);
             room.broadcastRoom();
             room.flush();
@@ -216,12 +229,8 @@ export class RoomManager implements RoomHost {
       m.token = token;
     }
     this.tokenIndex.set(m.token, code);
-    if (conn.remoteSid) {
-      room.attachRemote(m.id, conn.remoteSid);
-    } else {
-      room.attachConn(m.id, conn);
-    }
-    conn.name = name;
+    this.onTokenIndexed(code, m.token);
+    this.attachMember(room, m, conn);
     room.sendWelcome(m);
     room.broadcastRoom();
     room.flush();
@@ -240,12 +249,8 @@ export class RoomManager implements RoomHost {
       const m = room.memberByToken(token);
       if (m) {
         this.tokenIndex.set(token, code!);
-        if (conn.remoteSid) {
-          room.attachRemote(m.id, conn.remoteSid);
-        } else {
-          room.attachConn(m.id, conn);
-        }
-        conn.name = m.name;
+        this.onTokenIndexed(code!, token);
+        this.attachMember(room, m, conn);
         room.sendWelcome(m);
         room.broadcastRoom();
         room.flush();
@@ -259,12 +264,8 @@ export class RoomManager implements RoomHost {
     const m = room.addMember(name);
     if (token && /^[A-Za-z0-9_-]{8,64}$/.test(token)) m.token = token;
     this.tokenIndex.set(m.token, code!);
-    if (conn.remoteSid) {
-      room.attachRemote(m.id, conn.remoteSid);
-    } else {
-      room.attachConn(m.id, conn);
-    }
-    conn.name = name;
+    this.onTokenIndexed(code!, m.token);
+    this.attachMember(room, m, conn);
     if (room.phase !== 'lobby') {
       // addMember already spawned the sim player — late joiner is live now.
       room.pending.push({ to: null, msg: { t: 'notice', msg: `${name} joined the match` } });

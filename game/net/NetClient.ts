@@ -49,6 +49,14 @@ export class NetClient {
     this.transport.onMessage = (m) => this.handle(m);
     this.transport.onStatus = (s) => {
       this.status = s;
+      // The stream/socket can be replaced mid-session (Vercel rotates the SSE
+      // stream at its max-duration limit, or a network blip drops it). The
+      // replacement stream attaches a fresh conn server-side, so re-claim the
+      // room slot with the issued token — the server re-attaches us and the
+      // match continues. Idempotent: hello without membership just acks.
+      if (s === 'online' && this.token) {
+        this.transport.send({ t: 'hello', name: this.name, token: this.token });
+      }
       this.handlers.onStatus?.(s, this.ping);
     };
   }
@@ -80,7 +88,9 @@ export class NetClient {
     switch (m.t) {
       case 'welcome':
         this.myId = m.pid;
-        this.token = m.token;
+        // A guest ack (pid 'guest', empty token) must not wipe the real token —
+        // it is the only way back into the slot after a stream replacement.
+        if (m.token) this.token = m.token;
         this.handlers.onWelcome?.(m.pid, m.token, m.room);
         break;
       case 'error':

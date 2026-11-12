@@ -266,6 +266,13 @@ vercel deploy
 `vercel.json` disables buffering for `/api/rt/*` so SSE chunks flush immediately.
 Works out of the box for small groups of players.
 
+Serverless functions have a hard execution ceiling (`maxDuration = 300` on the
+Hobby plan), so the SSE stream **rotates itself every ~4.5 minutes**: it closes
+cleanly before the platform could kill it, the browser reconnects within a
+second (EventSource `retry` hint), and the player reclaims their slot with the
+session token — a running match continues without a visible disconnect. The
+same recovery covers any network blip that drops the stream.
+
 **Scaling beyond one instance:** without a shared store, rooms live in the
 memory of whichever serverless instance created them. To make rooms work across
 instances (and survive instance churn), add the optional Upstash Redis
@@ -314,6 +321,7 @@ stored blob. To force a transport in the browser, set `NEXT_PUBLIC_TRANSPORT`
 | No audio until you play | Browsers require a user gesture; audio unlocks on first click/touch. |
 | `test:mp` timing out | The suite needs ~2–3 min wall clock; give it a generous timeout. |
 | SSE stream stalls behind a proxy | Ensure the proxy doesn't buffer responses (`X-Accel-Buffering: no` is already sent; nginx needs `proxy_buffering off`). |
+| Game freezes after ~5 min on Vercel | Streams rotate at the platform's `maxDuration`; reconnect + token reclaim should be seamless. If it freezes, the reconnect likely landed on a different serverless instance — add the Upstash Redis variables so rooms work across instances. |
 
 ---
 

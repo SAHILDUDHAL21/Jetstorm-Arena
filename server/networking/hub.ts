@@ -11,8 +11,10 @@
  * owner dies, another instance adopts the room from the last blob.
  */
 import type { ClientMsg, ServerMsg } from '../../shared/types';
+import type { MapId } from '../../shared/maps';
 import { RoomManager, type ManagedConn } from '../rooms/manager';
 import { Room, type RoomOutput } from '../rooms/room';
+import { errorText } from '../validation';
 import { getStore, type RealtimeStore, type RoomBlob } from '../store';
 import { RateLimiter } from './ratelimit';
 
@@ -49,6 +51,8 @@ interface HubGlobal {
   polling: boolean;
   timer: ReturnType<typeof setInterval> | null;
   onRoomOutputs(code: string, out: RoomOutput[]): void;
+  /** Wired to the Hub instance (see Hub.instance). */
+  onRoomCreated(code: string): Promise<void> | void;
 }
 
 declare global {
@@ -83,6 +87,21 @@ export class HubRoomManager extends RoomManager {
     }
     this.hub.onRoomOutputs(code, out);
   }
+
+  /** Mirror token → room in the shared store (cross-instance reconnects). */
+  protected override onTokenIndexed(code: string, token: string): void {
+    if (this.hub.store.mode === 'redis') {
+      void this.hub.store.setTokenIndex(token, code).catch(() => {});
+    }
+  }
+
+  /** A room was created on this instance: claim the lease + publish the blob
+   * right away, before the tick loop runs. */
+  override createRoom(conn: ManagedConn, name: string, token?: string, mapId?: MapId): Room {
+    const room = super.createRoom(conn, name, token, mapId);
+    void this.hub.onRoomCreated(room.code);
+    return room;
+  }
 }
 
 function getGlobal(): HubGlobal {
@@ -104,6 +123,7 @@ function getGlobal(): HubGlobal {
     polling: false,
     timer: null,
     onRoomOutputs: () => {},
+    onRoomCreated: () => {},
   };
   g.mgr = new HubRoomManager(g);
   globalThis.__JSA_HUB__ = g;
@@ -133,6 +153,10 @@ export class Hub {
     }
     if (!Hub._i) Hub._i = new Hub(g);
     else Hub._i.g = g;
+    // (Re)wire the host hooks every time — managers are recreated on HMR wipe
+    // and the previous no-op wiring would silently lose blob/chat tracking.
+    g.onRoomOutputs = (code, out) => Hub._i!.onRoomOutputs(code, out);
+    g.onRoomCreated = (code) => Hub._i!.onRoomCreated(code);
     return Hub._i;
   }
 
@@ -149,6 +173,7 @@ export class Hub {
   // ── Streams (sessions) ─────────────────────────────────────────────────
 
   attachStream(sid: string, send: (chunk: string) => void, close: () => void): Session {
+    const prev = this.g.sessions.get(sid);
     const conn: ManagedConn = {
       id: sid,
       send: (msg: ServerMsg) => {
@@ -175,7 +200,49 @@ export class Hub {
       closed: false,
     };
     this.g.sessions.set(sid, session);
+    if (prev && !prev.closed) {
+      // Stream replaced while the session is still alive (platform rotates the
+      // SSE stream at maxDuration, or a network blip dropped it). Carry the
+      // membership and delivery cursors onto the fresh stream; for a locally
+      // owned room, attach the new conn directly so the player keeps receiving
+      // sends. A follow-up hello/token reclaim is idempotent after this.
+      const pc = prev.conn;
+      conn.roomId = pc.roomId;
+      conn.playerId = pc.playerId;
+      conn.name = pc.name;
+      session.roomId = prev.roomId;
+      session.lastBlobTs = prev.lastBlobTs;
+      session.lastSnapTick = prev.lastSnapTick;
+      session.lastChatId = prev.lastChatId;
+      session.lastNoticeId = prev.lastNoticeId;
+      const room = pc.roomId ? this.g.mgr.rooms.get(pc.roomId) : undefined;
+      if (room && pc.playerId) {
+        // Attach the fresh conn first, then drop the dead predecessor — with
+        // the new conn already in the set this is a silent swap (no disconnect
+        // notice, no grace countdown).
+        if (room.attachConn(pc.playerId, conn)) room.detachConn(pc);
+      }
+    }
+    // The previous instance may be gone entirely (hard kill): the store's
+    // route record tells this fresh session which room to keep serving.
+    void this.restoreSessionRoute(sid, session);
     return session;
+  }
+
+  /** Restore room membership for a re-attached session from the shared store
+   * (written when the stream instance last drained a welcome). */
+  private async restoreSessionRoute(sid: string, session: Session): Promise<void> {
+    if (session.closed || session.roomId) return;
+    try {
+      const prev = await this.g.store.getSessionRoute(sid);
+      if (!prev) return;
+      if (prev.room && !session.closed && !session.roomId) {
+        session.roomId = prev.room;
+        if (prev.pid && !session.conn.playerId) session.conn.playerId = prev.pid;
+      }
+    } catch {
+      /* store unavailable — hello/token reclaim still works */
+    }
   }
 
   detachStream(sid: string): void {
@@ -195,6 +262,7 @@ export class Hub {
       }
     }
     this.g.remoteConns.delete(sid);
+    void this.g.store.setSessionRoute(sid, { room: null, pid: null }).catch(() => {});
     void this.g.store.dropSession(sid).catch(() => {});
   }
 
@@ -211,9 +279,19 @@ export class Hub {
 
   async handleUplink(sid: string, raw: unknown): Promise<boolean> {
     const session = this.g.sessions.get(sid);
-    if (!session) return false;
+    if (session) return this.handleLocal(session, raw);
+    // No session on this instance: on serverless the POST may have landed on a
+    // different lambda than the one holding the SSE stream. Route via the
+    // shared store when available; otherwise signal the client to retry.
+    if (this.g.store.mode !== 'redis') return false;
+    return this.handleRemote(sid, raw);
+  }
+
+  /** Uplink on the instance that owns the session. */
+  private async handleLocal(session: Session, raw: unknown): Promise<boolean> {
     const t = (raw as { t?: string } | null)?.t;
     const { mgr, store } = this.g;
+    const sid = session.sid;
 
     const routeRemote = async (code: string) => {
       await store.pushInbox(code, { sid, msg: raw }).catch(() => {});
@@ -245,7 +323,7 @@ export class Hub {
     }
 
     // messages that require a room: route to the room's owner when remote
-    const roomMsg = ['leave', 'ready', 'start', 'rematch', 'input', 'switch', 'chat'];
+    const roomMsg = ['leave', 'ready', 'start', 'rematch', 'lobby', 'input', 'switch', 'chat'];
     if (t && roomMsg.includes(t) && session.roomId && !mgr.rooms.has(session.roomId)) {
       if (store.mode === 'redis') {
         await routeRemote(session.roomId);
@@ -255,6 +333,97 @@ export class Hub {
 
     mgr.handleMessage(session.conn, raw);
     return true;
+  }
+
+  /** Uplink that landed on an instance other than the one holding the SSE
+   * stream. Everything routes through the store so the room's owner processes
+   * it and replies reach the stream instance via its out-queue. */
+  private async handleRemote(sid: string, raw: unknown): Promise<boolean> {
+    const g = this.g;
+    const t = (raw as { t?: string } | null)?.t;
+    const reply = (m: ServerMsg) => g.store.pushOut(sid, m).catch(() => {});
+
+    switch (t) {
+      case 'ping':
+        await reply({ t: 'pong', ts: (raw as { ts?: number }).ts ?? 0 });
+        return true;
+
+      case 'hello': {
+        // Reconnect: find the room that issued this token and process there.
+        const token = (raw as { token?: string }).token;
+        if (typeof token === 'string') {
+          const code = await g.store.getTokenIndex(token).catch(() => null);
+          if (code) {
+            await g.store.pushInbox(code, { sid, msg: raw }).catch(() => {});
+            return true;
+          }
+        }
+        await reply({ t: 'welcome', pid: 'guest', token: '' });
+        return true;
+      }
+
+      case 'create':
+      case 'quick':
+        // No room exists yet — create it on THIS instance. The member is
+        // attached remotely (stream lives elsewhere); replies flow via out:sid.
+        g.mgr.handleMessage(this.facadeFor(sid, null), raw);
+        return true;
+
+      case 'join': {
+        const rawCode = (raw as { code?: string }).code;
+        const code = typeof rawCode === 'string' ? rawCode.toUpperCase() : null;
+        if (code && g.mgr.rooms.has(code)) {
+          g.mgr.handleMessage(this.facadeFor(sid, code), raw);
+          return true;
+        }
+        if (code) {
+          const blob = await g.store.getBlob(code).catch(() => null);
+          if (blob) {
+            await g.store.pushInbox(code, { sid, msg: raw }).catch(() => {});
+            return true;
+          }
+        }
+        await reply({ t: 'error', code: 'room_not_found', msg: errorText('room_not_found') });
+        return true;
+      }
+
+      default:
+        break;
+    }
+
+    // Room-bound messages: route to the room's owner. The route record was
+    // written when the stream instance drained the welcome.
+    const roomMsg = ['leave', 'ready', 'start', 'rematch', 'lobby', 'input', 'switch', 'chat'];
+    const route = await g.store.getSessionRoute(sid).catch(() => null);
+    if (route?.room && t && roomMsg.includes(t)) {
+      await g.store.pushInbox(route.room, { sid, msg: raw }).catch(() => {});
+      return true;
+    }
+    return false;
+  }
+
+  /** Reusable proxy conn for a remote session, keyed by sid. The room owner
+   * (or the instance that creates the room) keeps it so input frames carry
+   * the playerId assigned at join time. */
+  private facadeFor(sid: string, roomId: string | null): ManagedConn {
+    const g = this.g;
+    let facade = g.remoteConns.get(sid);
+    if (!facade) {
+      facade = {
+        id: sid,
+        send: (m: ServerMsg) => {
+          void g.store.pushOut(sid, m).catch(() => {});
+        },
+        close: () => {},
+        rate: new RateLimiter(),
+        roomId,
+        playerId: null,
+        name: null,
+        remoteSid: sid,
+      };
+      g.remoteConns.set(sid, facade);
+    }
+    return facade;
   }
 
   // ── Host hooks ─────────────────────────────────────────────────────────
@@ -285,7 +454,8 @@ export class Hub {
   async onRoomCreated(code: string): Promise<void> {
     const g = this.g;
     if (g.store.mode !== 'redis') return;
-    await g.store.tryAdopt(code, g.instanceId, LEASE_TTL_MS).catch(() => false);
+    const adopted = await g.store.tryAdopt(code, g.instanceId, LEASE_TTL_MS).catch(() => false);
+    if (adopted) g.lastLeaseRenew.set(code, Date.now());
     await this.publishBlob(code);
   }
 
@@ -340,13 +510,15 @@ export class Hub {
     for (const code of [...g.mgr.rooms.keys()]) {
       const room = g.mgr.rooms.get(code);
       if (!room) continue;
-      // lease maintenance
+      // lease maintenance — renew ours, adopt a free/expired one, lose if owned
       const lastRenew = g.lastLeaseRenew.get(code) ?? 0;
       if (now - lastRenew > LEASE_TTL_MS / 3) {
         g.lastLeaseRenew.set(code, now);
-        const ok = await g.store.renewLease(code, g.instanceId, LEASE_TTL_MS).catch(() => false);
-        if (!ok) {
-          // lost ownership — drop local room; another instance will take over
+        const res = await g.store
+          .renewOrAdoptLease(code, g.instanceId, LEASE_TTL_MS)
+          .catch(() => 'lost' as const);
+        if (res === 'lost') {
+          // another live instance owns it — drop the local copy; it takes over
           for (const m of [...room.members.values()]) {
             for (const c of m.conns) {
               c.roomId = null;
@@ -365,23 +537,7 @@ export class Hub {
           room.remoteDisconnect(item.sid);
           continue;
         }
-        let facade = g.remoteConns.get(item.sid);
-        if (!facade) {
-          facade = {
-            id: item.sid,
-            send: (m: ServerMsg) => {
-              void g.store.pushOut(item.sid, m).catch(() => {});
-            },
-            close: () => {},
-            rate: new RateLimiter(),
-            roomId: code,
-            playerId: null,
-            name: null,
-            remoteSid: item.sid,
-          };
-          g.remoteConns.set(item.sid, facade);
-        }
-        g.mgr.handleMessage(facade, item.msg);
+        g.mgr.handleMessage(this.facadeFor(item.sid, code), item.msg);
         if (!g.mgr.rooms.has(code)) break;
       }
       room.flush();
@@ -403,23 +559,42 @@ export class Hub {
     g.polling = true;
     try {
       const now = Date.now();
-      for (const session of [...g.sessions.values()]) {
-        if (session.closed) continue;
-        // direct replies (welcome/error) for remotely-joined sessions
-        const outs = await g.store.drainOut(session.sid, 16).catch(() => [] as ServerMsg[]);
-        for (const m of outs) {
+      const live = [...g.sessions.values()].filter((s) => !s.closed);
+      if (live.length === 0) return;
+
+      // 1) Direct replies (welcome/error/pong) for every session — one
+      //    round-trip for all of them, not one per session.
+      const outs = await g.store
+        .drainOutMany(live.map((s) => s.sid), 16)
+        .catch(() => new Map<string, ServerMsg[]>());
+      const remoteRooms = new Set<string>();
+      for (const session of live) {
+        for (const m of outs.get(session.sid) ?? []) {
           if (m.t === 'welcome' && m.room) {
             session.roomId = m.room;
             session.conn.playerId = m.pid;
             session.conn.roomId = m.room;
-          } else if (m.t === 'error') {
-            // leave roomId untouched (join failed)
+            // remember the route so uplink POSTs on other instances find us
+            void g.store
+              .setSessionRoute(session.sid, { room: m.room, pid: m.pid })
+              .catch(() => {});
           }
+          // 'error': leave roomId untouched (join failed)
           session.conn.send(m);
         }
-        if (!session.roomId) continue;
-        if (g.mgr.rooms.has(session.roomId)) continue; // locally owned → direct sends
-        const blob = await g.store.getBlob(session.roomId).catch(() => null);
+        if (session.roomId && !g.mgr.rooms.has(session.roomId)) {
+          remoteRooms.add(session.roomId);
+        }
+      }
+      if (remoteRooms.size === 0) return;
+
+      // 2) Blob feed for rooms owned by another instance — one round-trip.
+      const blobs = await g.store
+        .getBlobs([...remoteRooms])
+        .catch(() => new Map<string, RoomBlob | null>());
+      for (const session of live) {
+        if (!session.roomId || g.mgr.rooms.has(session.roomId)) continue;
+        const blob = blobs.get(session.roomId) ?? null;
         if (!blob) {
           // room vanished (owner died with no successor yet)
           continue;
@@ -478,6 +653,7 @@ export class Hub {
         m.remoteSid = bm.remoteSid;
       }
       g.mgr.tokenIndex.set(m.token, blob.code);
+      void g.store.setTokenIndex(m.token, blob.code).catch(() => {});
     }
     // local sessions reading this room become direct members now
     for (const session of g.sessions.values()) {

@@ -2,6 +2,10 @@
  * SSE + POST transport for serverless hosting (Vercel).
  *   downlink: EventSource → /api/rt/stream (auto-reconnects)
  *   uplink:   batched POST → /api/rt/msg every ~33ms
+ *
+ * The uplink waits for the stream's first successful open: the server
+ * registers the session when the stream attaches, and a POST that arrives
+ * earlier (cold starts can take seconds) would be dropped silently.
  */
 import type { ClientMsg, ServerMsg } from '../../shared/types';
 import type { NetStatus, Transport } from './Transport';
@@ -19,6 +23,10 @@ export class HttpTransport implements Transport {
   private queue: ClientMsg[] = [];
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private lastGood = 0;
+  /** Set after the first stream open — uplink is gated on it. */
+  private everOpened = false;
+  /** Earliest next uplink attempt after a failure (ms epoch). */
+  private retryAt = 0;
 
   connect(): void {
     this.closed = false;
@@ -34,7 +42,9 @@ export class HttpTransport implements Transport {
     const es = new EventSource(`/api/rt/stream?sid=${encodeURIComponent(this.sid)}`);
     this.es = es;
     es.onopen = () => {
+      this.everOpened = true;
       this.onStatus('online');
+      void this.flush(); // drain anything queued while the stream was opening
     };
     es.onmessage = (ev) => {
       try {
@@ -60,6 +70,11 @@ export class HttpTransport implements Transport {
 
   private async flush(): Promise<void> {
     if (this.closed || this.queue.length === 0) return;
+    // Before the first stream open there is no server-side session yet —
+    // sending now would lose these messages. Wait; openStream() flushes.
+    if (!this.everOpened) return;
+    // Brief backoff after a failure so a cold-start 503 storm doesn't hammer.
+    if (Date.now() < this.retryAt) return;
     const msgs = this.queue;
     this.queue = [];
     try {
@@ -73,11 +88,13 @@ export class HttpTransport implements Transport {
         // requeue control messages on failure (bounded)
         const control = msgs.filter((m) => m.t !== 'input');
         if (control.length && this.queue.length < 10) this.queue.unshift(...control);
+        this.retryAt = Date.now() + 300;
       }
     } catch {
       if (msgs.some((m) => m.t !== 'input') && this.queue.length < 10) {
         this.queue.unshift(...msgs.filter((m) => m.t !== 'input'));
       }
+      this.retryAt = Date.now() + 300;
     }
   }
 

@@ -2,6 +2,10 @@
  * Realtime uplink. Batches of validated client messages (inputs, actions).
  * Every message passes server-side validation and per-session rate limits;
  * the client can never write game state directly.
+ *
+ * 503 when the session is unknown to this instance AND no shared store is
+ * configured: the SSE stream registered it on another serverless instance,
+ * so retrying until a request lands there is the only option.
  */
 import type { NextRequest } from 'next/server';
 import { getHub } from '../../../../server/networking/hub';
@@ -25,7 +29,13 @@ export async function POST(request: NextRequest) {
     return new Response('bad batch', { status: 400 });
   }
   for (const m of list) {
-    await hub.handleUplink(sid, m);
+    const handled = await hub.handleUplink(sid, m);
+    if (!handled) {
+      return new Response('no session — retry', {
+        status: 503,
+        headers: { 'Cache-Control': 'no-store', 'Retry-After': '1' },
+      });
+    }
   }
   return new Response('ok', { headers: { 'Cache-Control': 'no-store' } });
 }

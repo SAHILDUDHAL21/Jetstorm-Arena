@@ -193,3 +193,22 @@ body {
 .game-mount canvas {
   display: block;
 }
+
+/* ── Developer badge ─────────────────────────────────────────────────── */
+.dev-badge {
+  background: color-mix(in srgb, var(--panel) 85%, transparent);
+  border: 1px solid var(--line);
+  color: var(--ink-dim);
+  backdrop-filter: blur(6px);
+  transition: border-color 0.15s, color 0.15s, box-shadow 0.15s;
+  user-select: none;
+  white-space: nowrap;
+}
+.dev-badge:hover {
+  border-color: var(--accent);
+  color: var(--ink);
+  box-shadow: 0 0 0 1px #ffbe5c33, 0 4px 18px -8px #ffbe5c66;
+}
+.dev-badge-name {
+  color: var(--accent);
+}
